@@ -1,5 +1,7 @@
+import json
 from datetime import datetime
 
+import redis
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -9,16 +11,48 @@ from app.schemas.task import TaskCreate, TaskOut, TaskUpdate
 
 router = APIRouter()
 
+# Connect to Redis (use localhost for dev, Redis URL for prod)
+try:
+    # Optional: read REDIS_URL from env if needed, but using localhost default for simplicity
+    redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+    REDIS_AVAILABLE = True
+except Exception:
+    REDIS_AVAILABLE = False
+    redis_client = None
+
 
 @router.get("", response_model=list[TaskOut])
 def list_tasks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    cache_key = f"tasks:user:{current_user.id}"
+
+    # Try cache first
+    if REDIS_AVAILABLE:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+
+    # Cache miss or Redis down — query DB
     q = db.query(Task)
     if current_user.role != "admin":
         q = q.filter(Task.owner_id == current_user.id)
-    return q.order_by(Task.id.desc()).all()
+    tasks = q.order_by(Task.id.desc()).all()
+
+    # Store in cache (30 second TTL)
+    if REDIS_AVAILABLE:
+        try:
+            task_dicts = [TaskOut.model_validate(t).model_dump(mode="json") for t in tasks]
+            redis_client.setex(cache_key, 30, json.dumps(task_dicts))
+        except Exception:
+            pass
+
+    return tasks
 
 
 @router.post("", response_model=TaskOut, status_code=201)
@@ -36,6 +70,14 @@ def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
+
+    # Invalidate cache
+    if REDIS_AVAILABLE:
+        try:
+            redis_client.delete(f"tasks:user:{current_user.id}")
+        except Exception:
+            pass
+
     return task
 
 
@@ -84,6 +126,14 @@ def update_task(
     task.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(task)
+
+    # Invalidate cache
+    if REDIS_AVAILABLE:
+        try:
+            redis_client.delete(f"tasks:user:{current_user.id}")
+        except Exception:
+            pass
+
     return task
 
 
@@ -98,4 +148,12 @@ def delete_task(
 
     db.delete(task)
     db.commit()
-    return {"deleted": True}
+
+    # Invalidate cache
+    if REDIS_AVAILABLE:
+        try:
+            redis_client.delete(f"tasks:user:{current_user.id}")
+        except Exception:
+            pass
+
+    return {"deleted": True}
